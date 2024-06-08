@@ -1,6 +1,7 @@
 package tcp
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -124,9 +125,9 @@ func TestLoadBalancing(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
 
-			balancer := NewWRRLoadBalancer()
+			balancer := NewWRRLoadBalancer(false)
 			for server, weight := range test.serversWeight {
-				balancer.AddWeightServer(HandlerFunc(func(conn WriteCloser) {
+				balancer.AddWeightServer("first", HandlerFunc(func(conn WriteCloser) {
 					_, err := conn.Write([]byte(server))
 					require.NoError(t, err)
 				}), &weight)
@@ -141,4 +142,96 @@ func TestLoadBalancing(t *testing.T) {
 			assert.Equal(t, test.expectedClose, conn.closeCall)
 		})
 	}
+}
+
+type key string
+
+const serviceName key = "serviceName"
+
+func TestBalancerNoServiceUp(t *testing.T) {
+	balancer := NewWRRLoadBalancer(false)
+	weight := 1
+
+	balancer.AddWeightServer("first", HandlerFunc(func(conn WriteCloser) {
+		_, err := conn.Write([]byte("first"))
+		require.NoError(t, err)
+	}), &weight)
+
+	balancer.AddWeightServer("second", HandlerFunc(func(conn WriteCloser) {
+		_, err := conn.Write([]byte("second"))
+		require.NoError(t, err)
+	}), &weight)
+
+	balancer.SetStatus(context.WithValue(context.Background(), serviceName, "parent"), "first", false)
+	balancer.SetStatus(context.WithValue(context.Background(), serviceName, "parent"), "second", false)
+
+	conn := &fakeConn{writeCall: make(map[string]int)}
+
+	for i := 0; i < 3; i++ {
+		balancer.ServeTCP(conn)
+	}
+
+	assert.Equal(t, 0, len(conn.writeCall))
+	assert.Equal(t, 3, conn.closeCall)
+}
+
+func TestBalancerOneServerDown(t *testing.T) {
+	balancer := NewWRRLoadBalancer(false)
+	weight := 1
+
+	balancer.AddWeightServer("first", HandlerFunc(func(conn WriteCloser) {
+		_, err := conn.Write([]byte("first"))
+		require.NoError(t, err)
+	}), &weight)
+
+	balancer.AddWeightServer("second", HandlerFunc(func(conn WriteCloser) {
+		_, err := conn.Write([]byte("second"))
+		require.NoError(t, err)
+	}), &weight)
+	balancer.SetStatus(context.WithValue(context.Background(), serviceName, "parent"), "second", false)
+
+	conn := &fakeConn{writeCall: make(map[string]int)}
+
+	for i := 0; i < 3; i++ {
+		balancer.ServeTCP(conn)
+	}
+
+	assert.Equal(t, 3, conn.writeCall["first"])
+	assert.Equal(t, 0, conn.writeCall["second"])
+	assert.Equal(t, 0, conn.closeCall)
+}
+
+func TestBalancerDownThenUp(t *testing.T) {
+	balancer := NewWRRLoadBalancer(false)
+	weight := 1
+
+	balancer.AddWeightServer("first", HandlerFunc(func(conn WriteCloser) {
+		_, err := conn.Write([]byte("first"))
+		require.NoError(t, err)
+	}), &weight)
+
+	balancer.AddWeightServer("second", HandlerFunc(func(conn WriteCloser) {
+		_, err := conn.Write([]byte("second"))
+		require.NoError(t, err)
+	}), &weight)
+	balancer.SetStatus(context.WithValue(context.Background(), serviceName, "parent"), "second", false)
+
+	conn := &fakeConn{writeCall: make(map[string]int)}
+	for i := 0; i < 3; i++ {
+		balancer.ServeTCP(conn)
+	}
+	assert.Equal(t, 3, conn.writeCall["first"])
+	assert.Equal(t, 0, conn.writeCall["second"])
+	assert.Equal(t, 0, conn.closeCall)
+
+	balancer.SetStatus(context.WithValue(context.Background(), serviceName, "parent"), "second", true)
+
+	conn = &fakeConn{writeCall: make(map[string]int)}
+
+	for i := 0; i < 2; i++ {
+		balancer.ServeTCP(conn)
+	}
+	assert.Equal(t, 1, conn.writeCall["first"])
+	assert.Equal(t, 1, conn.writeCall["second"])
+	assert.Equal(t, 0, conn.closeCall)
 }

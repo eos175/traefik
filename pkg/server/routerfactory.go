@@ -88,12 +88,14 @@ func (f *RouterFactory) CreateRouters(rtConf *runtime.Configuration) (map[string
 	serviceManager.LaunchHealthCheck(ctx)
 
 	// TCP
-	svcTCPManager := tcpsvc.NewManager(rtConf, f.dialerManager)
+	svcTCPManager := tcpsvc.NewManager(rtConf, f.observabilityMgr, f.dialerManager)
 
 	middlewaresTCPBuilder := tcpmiddleware.NewBuilder(rtConf.TCPMiddlewares)
 
 	rtTCPManager := tcprouter.NewManager(rtConf, svcTCPManager, middlewaresTCPBuilder, handlersNonTLS, handlersTLS, f.tlsManager)
 	routersTCP := rtTCPManager.BuildHandlers(ctx, f.entryPointsTCP)
+
+	svcTCPManager.LaunchHealthCheck(ctx)
 
 	// UDP
 	svcUDPManager := udpsvc.NewManager(rtConf)

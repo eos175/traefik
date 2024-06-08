@@ -2,15 +2,20 @@ package tcp
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"net"
+	"net/url"
 	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/runtime"
+	"github.com/traefik/traefik/v3/pkg/healthcheck"
 	"github.com/traefik/traefik/v3/pkg/logs"
+	"github.com/traefik/traefik/v3/pkg/server/middleware"
 	"github.com/traefik/traefik/v3/pkg/server/provider"
 	"github.com/traefik/traefik/v3/pkg/tcp"
 	"golang.org/x/net/proxy"
@@ -18,17 +23,22 @@ import (
 
 // Manager is the TCPHandlers factory.
 type Manager struct {
-	dialerManager *tcp.DialerManager
-	configs       map[string]*runtime.TCPServiceInfo
-	rand          *rand.Rand // For the initial shuffling of load-balancers.
+	dialerManager    *tcp.DialerManager
+	observabilityMgr *middleware.ObservabilityMgr
+
+	configs        map[string]*runtime.TCPServiceInfo
+	healthCheckers map[string]*healthcheck.ServiceHealthChecker
+	rand           *rand.Rand // For the initial shuffling of load-balancers.
 }
 
 // NewManager creates a new manager.
-func NewManager(conf *runtime.Configuration, dialerManager *tcp.DialerManager) *Manager {
+func NewManager(conf *runtime.Configuration, observabilityMgr *middleware.ObservabilityMgr, dialerManager *tcp.DialerManager) *Manager {
 	return &Manager{
-		dialerManager: dialerManager,
-		configs:       conf.TCPServices,
-		rand:          rand.New(rand.NewSource(time.Now().UnixNano())),
+		dialerManager:    dialerManager,
+		observabilityMgr: observabilityMgr,
+		configs:          conf.TCPServices,
+		healthCheckers:   make(map[string]*healthcheck.ServiceHealthChecker),
+		rand:             rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -52,7 +62,10 @@ func (m *Manager) BuildTCP(rootCtx context.Context, serviceName string) (tcp.Han
 
 	switch {
 	case conf.LoadBalancer != nil:
-		loadBalancer := tcp.NewWRRLoadBalancer()
+		service := conf.LoadBalancer
+
+		loadBalancer := tcp.NewWRRLoadBalancer(service.HealthCheck != nil)
+		healthCheckTargets := make(map[string]*url.URL)
 
 		if conf.LoadBalancer.TerminationDelay != nil {
 			log.Ctx(ctx).Warn().Msgf("Service %q load balancer uses `TerminationDelay`, but this option is deprecated, please use ServersTransport configuration instead.", serviceName)
@@ -63,6 +76,12 @@ func (m *Manager) BuildTCP(rootCtx context.Context, serviceName string) (tcp.Han
 		}
 
 		for index, server := range shuffle(conf.LoadBalancer.Servers, m.rand) {
+			proxyName := makeProxyName(server.Address)
+			target := &url.URL{
+				Scheme: "tcp",
+				Host:   server.Address,
+			}
+
 			srvLogger := logger.With().
 				Int(logs.ServerIndex, index).
 				Str("serverAddress", server.Address).Logger()
@@ -91,14 +110,33 @@ func (m *Manager) BuildTCP(rootCtx context.Context, serviceName string) (tcp.Han
 				continue
 			}
 
-			loadBalancer.AddServer(handler)
+			loadBalancer.AddServer(proxyName, handler)
+
+			// servers are considered UP by default.
+			conf.UpdateServerStatus(target.String(), runtime.StatusUp)
+
+			healthCheckTargets[proxyName] = target
+
 			logger.Debug().Msg("Creating TCP server")
+		}
+
+		if service.HealthCheck != nil {
+			m.healthCheckers[serviceName] = healthcheck.NewServiceHealthChecker(
+				ctx,
+				m.observabilityMgr.MetricsRegistry(),
+				service.HealthCheck,
+				loadBalancer,
+				conf,
+				nil,
+				healthCheckTargets,
+			)
 		}
 
 		return loadBalancer, nil
 
 	case conf.Weighted != nil:
-		loadBalancer := tcp.NewWRRLoadBalancer()
+
+		loadBalancer := tcp.NewWRRLoadBalancer(conf.Weighted.HealthCheck != nil)
 
 		for _, service := range shuffle(conf.Weighted.Services, m.rand) {
 			handler, err := m.BuildTCP(ctx, service.Name)
@@ -107,7 +145,7 @@ func (m *Manager) BuildTCP(rootCtx context.Context, serviceName string) (tcp.Han
 				return nil, err
 			}
 
-			loadBalancer.AddWeightServer(handler, service.Weight)
+			loadBalancer.AddWeightServer(service.Name, handler, service.Weight)
 		}
 
 		return loadBalancer, nil
@@ -117,6 +155,20 @@ func (m *Manager) BuildTCP(rootCtx context.Context, serviceName string) (tcp.Han
 		conf.AddError(err, true)
 		return nil, err
 	}
+}
+
+// LaunchHealthCheck launches the health checks.
+func (m *Manager) LaunchHealthCheck(ctx context.Context) {
+	for serviceName, hc := range m.healthCheckers {
+		logger := log.Ctx(ctx).With().Str(logs.ServiceName, serviceName).Logger()
+		go hc.Launch(logger.WithContext(ctx))
+	}
+}
+
+func makeProxyName(s string) string {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(s)) // this will never return an error.
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func shuffle[T any](values []T, r *rand.Rand) []T {
