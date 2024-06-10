@@ -7,11 +7,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os/signal"
 	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
 	gokitmetrics "github.com/go-kit/kit/metrics"
 	"github.com/rs/zerolog/log"
+	tcpshaker "github.com/tevino/tcp-shaker"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 	"github.com/traefik/traefik/v3/pkg/config/runtime"
 	"google.golang.org/grpc"
@@ -167,14 +171,11 @@ func (shc *ServiceHealthChecker) executeHealthCheck(ctx context.Context, config 
 // checkHealthTCP returns an error with a meaningful description if the health check failed.
 // Dedicated to TCP servers.
 func (shc *ServiceHealthChecker) checkHealthTCP(ctx context.Context, target *url.URL) error {
-	d := net.Dialer{
-		Timeout: shc.timeout,
-	}
-	conn, err := d.DialContext(ctx, "tcp", target.Host)
+	_ = ctx
+	err := getTCPChecker().CheckAddr(target.Host, shc.timeout)
 	if err != nil {
 		return fmt.Errorf("TCP connection failed: %w", err)
 	}
-	defer conn.Close()
 
 	return nil
 }
@@ -286,4 +287,28 @@ func (shc *ServiceHealthChecker) checkHealthGRPC(ctx context.Context, serverURL 
 	}
 
 	return nil
+}
+
+var (
+	tcpChecker *tcpshaker.Checker
+	once       sync.Once
+)
+
+// getTCPChecker initializes a singleton instance of tcp-shaker.Checker.
+// It starts the Checker's CheckingLoop in a goroutine with a context that listens for system
+// signals (SIGINT, SIGTERM) to stop gracefully. This function blocks until the Checker is ready.
+func getTCPChecker() *tcpshaker.Checker {
+	once.Do(func() {
+		tcpChecker = tcpshaker.NewChecker()
+		go func() {
+			ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
+			if err := tcpChecker.CheckingLoop(ctx); err != nil {
+				log.Error().Err(err).Msg("TCP checking loop stopped")
+			}
+		}()
+		<-tcpChecker.WaitReady() // TODO()
+	})
+
+	return tcpChecker
 }
