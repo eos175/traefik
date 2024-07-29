@@ -167,7 +167,7 @@ func Test_Routing(t *testing.T) {
 
 	dialerManager := tcp2.NewDialerManager(nil)
 	dialerManager.Update(map[string]*dynamic.TCPServersTransport{"default@internal": {}})
-	serviceManager := tcp.NewManager(conf, dialerManager)
+	serviceManager := tcp.NewManager(conf, nil, dialerManager)
 
 	certPEM, keyPEM, err := generate.KeyPair("foo.bar", time.Time{})
 	require.NoError(t, err)

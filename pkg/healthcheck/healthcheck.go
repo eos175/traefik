@@ -7,11 +7,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os/signal"
 	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
 	gokitmetrics "github.com/go-kit/kit/metrics"
 	"github.com/rs/zerolog/log"
+	tcpshaker "github.com/tevino/tcp-shaker"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 	"github.com/traefik/traefik/v3/pkg/config/runtime"
 	"google.golang.org/grpc"
@@ -21,12 +25,19 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const modeGRPC = "grpc"
+const (
+	modeGRPC = "grpc"
+	modeTCP  = "tcp"
+)
 
 // StatusSetter should be implemented by a service that, when the status of a
 // registered target change, needs to be notified of that change.
 type StatusSetter interface {
 	SetStatus(ctx context.Context, childName string, up bool)
+}
+
+type StatusServerUpdater interface {
+	UpdateServerStatus(server, status string)
 }
 
 // StatusUpdater should be implemented by a service that, when its status
@@ -42,7 +53,7 @@ type metricsHealthCheck interface {
 
 type ServiceHealthChecker struct {
 	balancer StatusSetter
-	info     *runtime.ServiceInfo
+	info     StatusServerUpdater
 
 	config   *dynamic.ServerHealthCheck
 	interval time.Duration
@@ -54,7 +65,7 @@ type ServiceHealthChecker struct {
 	targets map[string]*url.URL
 }
 
-func NewServiceHealthChecker(ctx context.Context, metrics metricsHealthCheck, config *dynamic.ServerHealthCheck, service StatusSetter, info *runtime.ServiceInfo, transport http.RoundTripper, targets map[string]*url.URL) *ServiceHealthChecker {
+func NewServiceHealthChecker(ctx context.Context, metrics metricsHealthCheck, config *dynamic.ServerHealthCheck, service StatusSetter, info StatusServerUpdater, transport http.RoundTripper, targets map[string]*url.URL) *ServiceHealthChecker {
 	logger := log.Ctx(ctx)
 
 	interval := time.Duration(config.Interval)
@@ -150,7 +161,23 @@ func (shc *ServiceHealthChecker) executeHealthCheck(ctx context.Context, config 
 	if config.Mode == modeGRPC {
 		return shc.checkHealthGRPC(ctx, target)
 	}
+	if config.Mode == modeTCP {
+		return shc.checkHealthTCP(ctx, target)
+	}
+
 	return shc.checkHealthHTTP(ctx, target)
+}
+
+// checkHealthTCP returns an error with a meaningful description if the health check failed.
+// Dedicated to TCP servers.
+func (shc *ServiceHealthChecker) checkHealthTCP(ctx context.Context, target *url.URL) error {
+	_ = ctx
+	err := getTCPChecker().CheckAddr(target.Host, shc.timeout)
+	if err != nil {
+		return fmt.Errorf("TCP connection failed: %w", err)
+	}
+
+	return nil
 }
 
 // checkHealthHTTP returns an error with a meaningful description if the health check failed.
@@ -260,4 +287,28 @@ func (shc *ServiceHealthChecker) checkHealthGRPC(ctx context.Context, serverURL 
 	}
 
 	return nil
+}
+
+var (
+	tcpChecker *tcpshaker.Checker
+	once       sync.Once
+)
+
+// getTCPChecker initializes a singleton instance of tcp-shaker.Checker.
+// It starts the Checker's CheckingLoop in a goroutine with a context that listens for system
+// signals (SIGINT, SIGTERM) to stop gracefully. This function blocks until the Checker is ready.
+func getTCPChecker() *tcpshaker.Checker {
+	once.Do(func() {
+		tcpChecker = tcpshaker.NewChecker()
+		go func() {
+			ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
+			if err := tcpChecker.CheckingLoop(ctx); err != nil {
+				log.Error().Err(err).Msg("TCP checking loop stopped")
+			}
+		}()
+		<-tcpChecker.WaitReady() // TODO()
+	})
+
+	return tcpChecker
 }

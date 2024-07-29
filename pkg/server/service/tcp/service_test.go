@@ -247,7 +247,7 @@ func TestManager_BuildTCP(t *testing.T) {
 
 			manager := NewManager(&runtime.Configuration{
 				TCPServices: test.configs,
-			}, dialerManager)
+			}, nil, dialerManager)
 
 			ctx := context.Background()
 			if len(test.providerName) > 0 {

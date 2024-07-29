@@ -1,6 +1,7 @@
 package tcp
 
 import (
+	"context"
 	"errors"
 	"sync"
 
@@ -9,30 +10,96 @@ import (
 
 type server struct {
 	Handler
+	name   string
 	weight int
 }
 
 // WRRLoadBalancer is a naive RoundRobin load balancer for TCP services.
 type WRRLoadBalancer struct {
-	servers       []server
-	lock          sync.Mutex
+	servers    []server
+	handlersMu sync.Mutex
+
+	wantsHealthCheck bool
+
 	currentWeight int
 	index         int
+
+	// status is a record of which child services of the Balancer are healthy, keyed
+	// by name of child service. A service is initially added to the map when it is
+	// created via Add, and it is later removed or added to the map as needed,
+	// through the SetStatus method.
+	status map[string]struct{}
+	// updaters is the list of hooks that are run (to update the Balancer
+	// parent(s)), whenever the Balancer status changes.
+	updaters []func(bool)
 }
 
 // NewWRRLoadBalancer creates a new WRRLoadBalancer.
-func NewWRRLoadBalancer() *WRRLoadBalancer {
+func NewWRRLoadBalancer(wantHealthCheck bool) *WRRLoadBalancer {
 	return &WRRLoadBalancer{
-		index: -1,
+		index:            -1,
+		wantsHealthCheck: wantHealthCheck,
+		status:           make(map[string]struct{}),
 	}
+}
+
+// /traefik/pkg/server/service/loadbalancer/wrr.go
+
+// SetStatus sets on the balancer that its given child is now of the given
+// status. balancerName is only needed for logging purposes.
+func (b *WRRLoadBalancer) SetStatus(ctx context.Context, childName string, up bool) {
+	b.handlersMu.Lock()
+	defer b.handlersMu.Unlock()
+
+	upBefore := len(b.status) > 0
+
+	status := "DOWN"
+	if up {
+		status = "UP"
+	}
+
+	log.Ctx(ctx).Debug().Msgf("Setting status of %s to %v", childName, status)
+
+	if up {
+		b.status[childName] = struct{}{}
+	} else {
+		delete(b.status, childName)
+	}
+
+	upAfter := len(b.status) > 0
+	status = "DOWN"
+	if upAfter {
+		status = "UP"
+	}
+
+	// No Status Change
+	if upBefore == upAfter {
+		// We're still with the same status, no need to propagate
+		log.Ctx(ctx).Debug().Msgf("Still %s, no need to propagate", status)
+		return
+	}
+
+	// Status Change
+	log.Ctx(ctx).Debug().Msgf("Propagating new %s status", status)
+	for _, fn := range b.updaters {
+		fn(upAfter)
+	}
+}
+
+// RegisterStatusUpdater adds fn to the list of hooks that are run when the
+// status of the Balancer changes.
+// Not thread safe.
+func (b *WRRLoadBalancer) RegisterStatusUpdater(fn func(up bool)) error {
+	if !b.wantsHealthCheck {
+		return errors.New("healthCheck not enabled in config for this weighted service")
+	}
+	b.updaters = append(b.updaters, fn)
+	return nil
 }
 
 // ServeTCP forwards the connection to the right service.
 func (b *WRRLoadBalancer) ServeTCP(conn WriteCloser) {
-	b.lock.Lock()
 	next, err := b.next()
-	b.lock.Unlock()
-
 	if err != nil {
 		log.Error().Err(err).Msg("Error during load balancing")
 		conn.Close()
@@ -43,21 +110,27 @@ func (b *WRRLoadBalancer) ServeTCP(conn WriteCloser) {
 }
 
 // AddServer appends a server to the existing list.
-func (b *WRRLoadBalancer) AddServer(serverHandler Handler) {
+func (b *WRRLoadBalancer) AddServer(name string, serverHandler Handler) {
 	w := 1
-	b.AddWeightServer(serverHandler, &w)
+	b.AddWeightServer(name, serverHandler, &w)
 }
 
 // AddWeightServer appends a server to the existing list with a weight.
-func (b *WRRLoadBalancer) AddWeightServer(serverHandler Handler, weight *int) {
-	b.lock.Lock()
-	defer b.lock.Unlock()
+func (b *WRRLoadBalancer) AddWeightServer(name string, serverHandler Handler, weight *int) {
+	b.handlersMu.Lock()
+	defer b.handlersMu.Unlock()
 
 	w := 1
 	if weight != nil {
 		w = *weight
 	}
-	b.servers = append(b.servers, server{Handler: serverHandler, weight: w})
+
+	b.servers = append(b.servers, server{
+		Handler: serverHandler,
+		name:    name,
+		weight:  w,
+	})
+	b.status[name] = struct{}{}
 }
 
 func (b *WRRLoadBalancer) maxWeight() int {
@@ -90,7 +163,10 @@ func gcd(a, b int) int {
 }
 
 func (b *WRRLoadBalancer) next() (Handler, error) {
-	if len(b.servers) == 0 {
+	b.handlersMu.Lock()
+	defer b.handlersMu.Unlock()
+
+	if len(b.servers) == 0 || len(b.status) == 0 {
 		return nil, errors.New("no servers in the pool")
 	}
 
@@ -107,6 +183,7 @@ func (b *WRRLoadBalancer) next() (Handler, error) {
 	// GCD across all enabled servers
 	gcd := b.weightGcd()
 
+	var srv server
 	for {
 		b.index = (b.index + 1) % len(b.servers)
 		if b.index == 0 {
@@ -115,9 +192,14 @@ func (b *WRRLoadBalancer) next() (Handler, error) {
 				b.currentWeight = max
 			}
 		}
-		srv := b.servers[b.index]
+		srv = b.servers[b.index]
 		if srv.weight >= b.currentWeight {
-			return srv, nil
+			if _, ok := b.status[srv.name]; ok {
+				break
+			}
 		}
 	}
+
+	log.Debug().Msgf("Service selected by WRR: %s", srv.name)
+	return srv, nil
 }
