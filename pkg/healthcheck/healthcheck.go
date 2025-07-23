@@ -182,8 +182,24 @@ func (shc *ServiceHealthChecker) checkHealthTCP(ctx context.Context, target *url
 
 // checkHealthHTTP returns an error with a meaningful description if the health check failed.
 // Dedicated to HTTP servers.
-func (shc *ServiceHealthChecker) checkHealthHTTP(ctx context.Context, target *url.URL) error {
-	req, err := shc.newRequest(ctx, target)
+func (shc *ServiceHealthChecker) checkHealthHTTP(ctx context.Context, target *url.URL, config *dynamic.ServerHealthCheck) error {
+
+	// Modify the host to match the one in the config without disrupting the gauge
+	// This is always an HTTP check even if running on a TCP service. Prevents incorrect scheme errors.
+	healthCheckTarget := *target
+	healthCheckTarget.Scheme = "http"
+
+	// Override the port if the healthcheck port differs from the service port
+	if config.Port != 0 {
+		healthCheckTarget.Host = fmt.Sprintf("%s:%d", healthCheckTarget.Hostname(), config.Port)
+	}
+
+	// If a healthcheck path is configured set it
+	if config.Path != "" {
+		healthCheckTarget.Path = config.Path
+	}
+
+	req, err := shc.newRequest(ctx, &healthCheckTarget)
 	if err != nil {
 		return fmt.Errorf("create HTTP request: %w", err)
 	}
@@ -202,7 +218,7 @@ func (shc *ServiceHealthChecker) checkHealthHTTP(ctx context.Context, target *ur
 	if shc.config.Status != 0 && shc.config.Status != resp.StatusCode {
 		return fmt.Errorf("received error status code: %v expected status code: %v", resp.StatusCode, shc.config.Status)
 	}
-
+	
 	return nil
 }
 
